@@ -39,6 +39,12 @@ Breaking: renaming/removing a command, flag, alias or env var; changing a defaul
 
 ## 2. HTTP API of the cockpit server (packages/cezar/src/server/server.ts)
 
+- 2026-11-15 Codex token-rate estimate: `GET /api/v1/workspace/dashboard/insights`
+  may add optional `costEstimateBasis` and per-backend `estimatedCostUsd`. The estimate is derived
+  only from complete measured input, cached-input and output token totals for an explicitly priced
+  Codex model. It never replaces `costUsd`, which remains provider-reported, and is omitted when
+  cost or token metrics are hidden. `reportedTasks` on the estimate counts estimated tasks.
+
 - 2026-11-13 Codex usage: run and step responses may include optional
   `cachedInputTokens`, and Usage & cost may include the same optional task amount
   and aggregate metric. It is a subset of `inputTokens`, never added to it.

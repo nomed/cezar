@@ -71,8 +71,19 @@ export const dashboardBackendStatSchema = z.object({
   medianCycleHours: z.number().finite().nonnegative().nullable(),
   /** Omitted when workspace settings hide cost. */
   costUsd: dashboardCostMetricSchema.optional(),
+  /** USD estimate derived from measured tokens and a dated OpenAI rate card. It is not provider-reported cost;
+   * `reportedTasks` counts tasks whose input, cached-input and output measurements were complete. */
+  estimatedCostUsd: dashboardCostMetricSchema.optional(),
 });
 export type DashboardBackendStat = z.infer<typeof dashboardBackendStatSchema>;
+
+export const dashboardCostEstimateBasisSchema = z.object({
+  kind: z.literal('token-rate-estimate'),
+  rateCardAsOf: z.iso.date(),
+  sourceUrl: z.url(),
+  currency: z.literal('USD'),
+});
+export type DashboardCostEstimateBasis = z.infer<typeof dashboardCostEstimateBasisSchema>;
 
 /** One automation's tasks created in the window, joined to its definition by the client. */
 export const dashboardAutomationStatSchema = z.object({
@@ -94,6 +105,8 @@ export const dashboardInsightsSchema = z.object({
   windowStart: iso,
   period: z.enum(['7d', '30d']),
   visibility: dashboardCostVisibilitySchema,
+  /** Present only when both cost and token metrics are visible. */
+  costEstimateBasis: dashboardCostEstimateBasisSchema.optional(),
   coverage: dashboardCoverageSchema,
   delivered: dashboardDeliveredSchema,
   failures: z.object({ total: count, reasons: z.array(dashboardFailureReasonSchema).max(8) }),

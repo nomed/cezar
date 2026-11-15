@@ -249,6 +249,7 @@ export function BackendComparison() {
   const query = useDashboardInsights(period)
   const data = query.data
   const cost = data?.visibility.cost
+  const estimate = !!cost && !!data?.visibility.tokens
   return (
     <section data-dashboard-module="backends" className="min-w-0">
     <Card className="gap-0 py-0" data-export-context={`Backends: ${periodText(period)}; finished tasks`}>
@@ -262,7 +263,20 @@ export function BackendComparison() {
           <>
             <p className={note}>
               Tasks that finished done or failed in the period, by the backend and model their
-              steps ran on. Includes subtasks. Cost is reported USD only.
+              steps ran on. Includes subtasks. Reported USD comes from the provider.
+              {data.costEstimateBasis && (
+                <> Codex estimated USD uses measured tokens and{' '}
+                  <a
+                    className="underline hover:text-foreground"
+                    href={data.costEstimateBasis.sourceUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    OpenAI standard rates dated {data.costEstimateBasis.rateCardAsOf}
+                  </a>
+                  ; it is not a subscription charge.
+                </>
+              )}
             </p>
             <Coverage coverage={data.coverage} retry={() => void query.refetch()} />
             {data.backends.length ? (
@@ -275,12 +289,18 @@ export function BackendComparison() {
                       <th className={th}>Success</th>
                       <th className={`${th} text-right`}>Median cycle</th>
                       {cost && <th className={`${th} text-right`}>Reported USD</th>}
+                      {estimate && <th className={`${th} text-right`}>Estimated USD</th>}
                       {cost && <th className={`${th} text-right`}>Per completed</th>}
                     </tr>
                   </thead>
                   <tbody>
                     {data.backends.map((b) => (
-                      <BackendRow key={`${b.backend}:${b.model ?? ''}`} stat={b} cost={!!cost} />
+                      <BackendRow
+                        key={`${b.backend}:${b.model ?? ''}`}
+                        stat={b}
+                        cost={!!cost}
+                        estimate={estimate}
+                      />
                     ))}
                   </tbody>
                 </table>
@@ -292,8 +312,8 @@ export function BackendComparison() {
               <Freshness at={data.asOf} />
             </span>
             <ExportRows
-              rows={data.backends.flatMap((b) =>
-                (['finished', 'done', 'failed', 'medianCycleHours'] as const).map((metric) => ({
+              rows={data.backends.flatMap((b) => [
+                ...(['finished', 'done', 'failed', 'medianCycleHours'] as const).map((metric) => ({
                   section: 'backends',
                   entity: `${b.backend}${b.model ? `:${b.model}` : ''}`,
                   metric,
@@ -301,7 +321,18 @@ export function BackendComparison() {
                   unit: metric === 'medianCycleHours' ? 'hours' : 'tasks',
                   asOf: data.asOf,
                 })),
-              )}
+                ...(cost ? [{
+                  section: 'backends', entity: `${b.backend}${b.model ? `:${b.model}` : ''}`,
+                  metric: 'costUsd', value: b.costUsd?.value ?? null, unit: 'USD',
+                  reportedTasks: b.costUsd?.reportedTasks ?? 0, totalTasks: b.finished, asOf: data.asOf,
+                }] : []),
+                ...(estimate ? [{
+                  section: 'backends', entity: `${b.backend}${b.model ? `:${b.model}` : ''}`,
+                  metric: 'estimatedCostUsd', value: b.estimatedCostUsd?.value ?? null, unit: 'USD',
+                  reportedTasks: b.estimatedCostUsd?.reportedTasks ?? 0, totalTasks: b.finished,
+                  asOf: data.asOf, note: 'OpenAI token-rate estimate; not a subscription charge',
+                }] : []),
+              ])}
             />
           </>
         )}
@@ -311,9 +342,15 @@ export function BackendComparison() {
   )
 }
 
-function BackendRow({ stat: b, cost }: { stat: DashboardBackendStat; cost: boolean }) {
+function BackendRow({ stat: b, cost, estimate }: { stat: DashboardBackendStat; cost: boolean; estimate: boolean }) {
   const rate = percent(b.done, b.finished)
   const usd = b.costUsd?.value
+  const estimatedUsd = b.estimatedCostUsd?.value
+  const perCompleted = usd != null
+    ? (b.done ? usd / b.done : null)
+    : estimatedUsd != null && b.done && b.estimatedCostUsd?.reportedTasks === b.finished
+      ? estimatedUsd / b.done
+      : null
   return (
     <tr className="border-t transition-colors hover:bg-muted/30">
       <td className="px-3 py-2.5">
@@ -346,9 +383,18 @@ function BackendRow({ stat: b, cost }: { stat: DashboardBackendStat; cost: boole
           </span>
         </td>
       )}
+      {estimate && (
+        <td className="px-3 py-2.5 text-right tabular-nums">
+          {estimatedUsd == null ? '—' : formatAmount(estimatedUsd, true)}
+          <span className={`block ${note}`}>
+            {b.estimatedCostUsd?.reportedTasks ?? 0}/{b.finished} estimated
+          </span>
+        </td>
+      )}
       {cost && (
         <td className="px-3 py-2.5 text-right tabular-nums">
-          {usd == null || !b.done ? '—' : formatAmount(usd / b.done, true)}
+          {perCompleted == null ? '—' : formatAmount(perCompleted, true)}
+          {usd == null && perCompleted != null && <span className={`block ${note}`}>estimated</span>}
         </td>
       )}
     </tr>

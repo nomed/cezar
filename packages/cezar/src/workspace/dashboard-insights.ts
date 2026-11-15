@@ -11,6 +11,7 @@ import type {
   RunStatus,
 } from '@open-mercato/cezar-contract';
 import { projectCostTask, type CostVisibility } from './dashboard-costs.ts';
+import { estimateOpenAiCodexUsd, OPENAI_CODEX_RATE_CARD } from './openai-codex-pricing.ts';
 
 /** Explicit allowlist, like `projectCostTask`: never prompts, step payloads or session ids. */
 export type InsightRow = {
@@ -33,6 +34,9 @@ export type InsightRow = {
   backend: string;
   model?: string;
   costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
   automationId?: string;
 };
 
@@ -88,6 +92,9 @@ export function projectInsightRow(projectId: string, run: RunRecord): InsightRow
     backend,
     ...(model ? { model } : {}),
     ...(costUsd !== undefined ? { costUsd } : {}),
+    ...(run.inputTokens !== undefined ? { inputTokens: run.inputTokens } : {}),
+    ...(run.outputTokens !== undefined ? { outputTokens: run.outputTokens } : {}),
+    ...(run.cachedInputTokens !== undefined ? { cachedInputTokens: run.cachedInputTokens } : {}),
     ...(automationId ? { automationId } : {}),
   };
 }
@@ -133,6 +140,15 @@ const cycleHours = (row: InsightRow) => {
 };
 function costMetric(rows: InsightRow[]): DashboardCostMetric {
   const values = rows.flatMap((r) => (r.costUsd !== undefined ? [r.costUsd] : []));
+  const sum = values.reduce((a, b) => a + b, 0);
+  return { value: values.length && Number.isFinite(sum) ? sum : null, reportedTasks: values.length };
+}
+function estimatedCostMetric(rows: InsightRow[]): DashboardCostMetric {
+  const values = rows.flatMap((row) => {
+    if (row.backend !== 'codex' || row.costUsd !== undefined) return [];
+    const value = estimateOpenAiCodexUsd(row.model, row);
+    return value === undefined ? [] : [value];
+  });
   const sum = values.reduce((a, b) => a + b, 0);
   return { value: values.length && Number.isFinite(sum) ? sum : null, reportedTasks: values.length };
 }
@@ -219,6 +235,7 @@ export function buildDashboardInsights(
         return h === null ? [] : [h];
       });
       const first = group[0]!;
+      const estimatedCostUsd = estimatedCostMetric(group);
       return {
         backend: first.backend,
         ...(first.model ? { model: first.model } : {}),
@@ -228,6 +245,9 @@ export function buildDashboardInsights(
         timedTasks: hours.length,
         medianCycleHours: median(hours),
         ...(visibility.cost ? { costUsd: costMetric(group) } : {}),
+        ...(visibility.cost && visibility.tokens && estimatedCostUsd.reportedTasks
+          ? { estimatedCostUsd }
+          : {}),
       };
     })
     .sort(
@@ -273,6 +293,9 @@ export function buildDashboardInsights(
     windowStart: new Date(start).toISOString(),
     period: query.period,
     visibility: { ...visibility },
+    ...(visibility.cost && visibility.tokens
+      ? { costEstimateBasis: { ...OPENAI_CODEX_RATE_CARD } }
+      : {}),
     coverage: structuredClone(coverage),
     delivered: {
       completedTasks: done.length,

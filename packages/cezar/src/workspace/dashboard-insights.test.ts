@@ -123,18 +123,45 @@ describe('dashboard insights', () => {
     const runs = [
       run({ runner: 'claude', model: 'opus', costUsd: 2 }),
       run({ runner: 'claude', model: 'opus', status: 'failed', costUsd: 1 }),
-      run({ runner: 'codex', costUsd: 0.5 }),
+      run({
+        runner: 'codex',
+        modelIdentity: 'openai/gpt-6.1-sol',
+        inputTokens: 1_000_000,
+        cachedInputTokens: 400_000,
+        outputTokens: 200_000,
+      }),
+      // A provider-reported amount remains authoritative and is not estimated too.
+      run({
+        runner: 'codex',
+        modelIdentity: 'openai/gpt-6.1-sol',
+        inputTokens: 1_000_000,
+        cachedInputTokens: 400_000,
+        outputTokens: 200_000,
+        costUsd: 0.5,
+      }),
     ];
     const shown = build(runs);
     expect(shown.backends.map((b) => [b.backend, b.model, b.finished, b.done, b.failed])).toEqual([
       ['claude', 'opus', 2, 1, 1],
-      ['codex', undefined, 1, 1, 0],
+      ['codex', 'openai/gpt-6.1-sol', 2, 2, 0],
     ]);
     expect(shown.backends[0]!.costUsd).toEqual({ value: 3, reportedTasks: 2 });
+    expect(shown.backends[0]!.estimatedCostUsd).toBeUndefined();
+    expect(shown.backends[1]!.costUsd).toEqual({ value: 0.5, reportedTasks: 1 });
+    expect(shown.backends[1]!.estimatedCostUsd).toEqual({ value: 3.24, reportedTasks: 1 });
+    expect(shown.costEstimateBasis).toMatchObject({
+      kind: 'token-rate-estimate',
+      rateCardAsOf: '2026-11-15',
+    });
     expect(shown.backends[0]!.medianCycleHours).toBe(1);
     const hidden = build(runs, { cost: false, tokens: true });
     expect(hidden.backends.every((b) => !('costUsd' in b))).toBe(true);
+    expect(hidden.backends.every((b) => !('estimatedCostUsd' in b))).toBe(true);
+    expect(hidden.costEstimateBasis).toBeUndefined();
     expect(hidden.automations.every((a) => !('costUsd' in a))).toBe(true);
+    const tokensHidden = build(runs, { cost: true, tokens: false });
+    expect(tokensHidden.backends.every((b) => !('estimatedCostUsd' in b))).toBe(true);
+    expect(tokensHidden.costEstimateBasis).toBeUndefined();
   });
 
   it('attributes tasks to the automation that launched them, scheduled or event-driven', () => {

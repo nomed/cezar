@@ -4,12 +4,20 @@ import { MemoryRouter } from 'react-router'
 import type { DashboardInsights } from '@open-mercato/cezar-api-client'
 import { AutomationOutcomes, BackendComparison, OutcomeInsights } from './insights'
 
-const state = vi.hoisted(() => ({ cost: true, failures: true, definitionsFailed: false, partial: false, big: false }))
+const state = vi.hoisted(() => ({ cost: true, tokens: true, failures: true, definitionsFailed: false, partial: false, big: false }))
 const insights = (): DashboardInsights => ({
   asOf: '2026-09-30T12:00:00.000Z',
   windowStart: '2026-09-24T00:00:00.000Z',
   period: '7d',
-  visibility: { cost: state.cost, tokens: true },
+  visibility: { cost: state.cost, tokens: state.tokens },
+  ...(state.cost && state.tokens ? {
+    costEstimateBasis: {
+      kind: 'token-rate-estimate' as const,
+      rateCardAsOf: '2026-11-15',
+      sourceUrl: 'https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing',
+      currency: 'USD' as const,
+    },
+  } : {}),
   coverage: {
     projects: [
       state.partial
@@ -72,12 +80,14 @@ const insights = (): DashboardInsights => ({
     },
     {
       backend: 'codex',
+      model: 'openai/gpt-6.1-sol',
       finished: 4,
       done: 2,
       failed: 2,
       timedTasks: 2,
       medianCycleHours: 1,
       ...(state.cost ? { costUsd: { value: null, reportedTasks: 0 } } : {}),
+      ...(state.cost && state.tokens ? { estimatedCostUsd: { value: 3.24, reportedTasks: 4 } } : {}),
     },
   ],
   automations: [
@@ -137,6 +147,7 @@ vi.mock('./automations-data', () => ({
 afterEach(() => {
   cleanup()
   state.cost = true
+  state.tokens = true
   state.failures = true
   state.definitionsFailed = false
   state.partial = false
@@ -179,9 +190,14 @@ it('compares backends with success rate and per-completed cost', () => {
   const table = screen.getByRole('region', { name: 'Backend comparison' })
   expect(within(table).getByText('Claude Code')).toBeTruthy()
   expect(within(table).getByText('claude-opus-5-5')).toBeTruthy()
-  expect(within(table).getByText('default model')).toBeTruthy()
+  expect(within(table).getByText('openai/gpt-6.1-sol')).toBeTruthy()
   expect(within(table).getByText('90%')).toBeTruthy()
   expect(within(table).getByText('$1.00')).toBeTruthy()
+  expect(within(table).getByText('$3.24')).toBeTruthy()
+  expect(within(table).getByText('4/4 estimated')).toBeTruthy()
+  expect(within(table).getByText('Estimated USD')).toBeTruthy()
+  expect(within(table).getByText('estimated')).toBeTruthy()
+  expect(screen.getByRole('link', { name: /OpenAI standard rates dated 2026-11-15/ })).toBeTruthy()
   expect(within(table).getByText('Per completed')).toBeTruthy()
 })
 
@@ -190,6 +206,13 @@ it('hides every cost column when settings hide cost', () => {
   show(<BackendComparison />)
   expect(screen.queryByText('Reported USD')).toBeNull()
   expect(screen.queryByText('Per completed')).toBeNull()
+})
+
+it('hides the token-derived estimate when token metrics are hidden', () => {
+  state.tokens = false
+  show(<BackendComparison />)
+  expect(screen.queryByText('Estimated USD')).toBeNull()
+  expect(screen.queryByText('$3.24')).toBeNull()
 })
 
 it('lists automation outcomes, including idle and removed automations', () => {
