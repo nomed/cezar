@@ -21,8 +21,12 @@ function isInstalled(): boolean {
   return installed || (navigator as { standalone?: boolean }).standalone === true
 }
 
-/** The shell and a phone PWA only: a browser tab has its own bottom bar. */
-export const showsBottomBar = (): boolean => isPhone() && (isCezarShell() || isInstalled())
+/**
+ * The phone navigation: the CezarBot shell at any size (an iPad too, in split view or landscape),
+ * and a phone PWA. A browser tab keeps the breakpoints: it has its own bottom bar, and iPadOS
+ * Safari asks for the desktop site.
+ */
+export const showsBottomBar = (): boolean => isCezarShell() || (isPhone() && isInstalled())
 
 let firstLocationKey: string | undefined
 
@@ -59,7 +63,9 @@ export function phoneLanding(input: PhoneLandingInput): 'wait' | 'manager' | 're
   if (input.health === undefined && !input.healthFailed) return 'wait'
   if (input.health?.capabilities.managers !== true) return 'restore'
   if (input.registry === undefined && !input.registryFailed) return 'wait'
-  if (input.agentCheckSkipped === undefined && !input.uiStateFailed) return 'wait'
+  // A signed-in agent settles the first-run question without ui-state, so a restored provider
+  // list lands at once rather than waiting on the network for it.
+  if (input.agentCheckSkipped === undefined && !input.uiStateFailed && hasSignedInAgent(input.providers) !== true) return 'wait'
   if (input.agentCheckSkipped !== true && input.providers === undefined && !input.providersFailed) return 'wait'
   return firstRunFinished(input) ? 'manager' : 'restore'
 }

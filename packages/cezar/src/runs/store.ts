@@ -338,6 +338,11 @@ export const runRecordSchema = z.object({
    * of red. Same invariant as `awaitingAnswerSince`: only a `failed` run carries it.
    */
   idleClosedAt: z.string().datetime().optional().catch(undefined),
+  /** The manager whose `task create` started this run (spec 2026-10-31-managers). */
+  startedByManager: z.object({ id: z.string(), name: z.string() }).optional().catch(undefined),
+  /** Why a `cancelled` run was stopped and who stopped it, when the canceller said (`POST /runs/:id/cancel`). */
+  cancelReason: z.string().optional(),
+  cancelledBy: z.string().optional(),
   /**
    * When the current wait on the user began: stamped by `updateRun` on entering `waiting` or on a
    * new question while there, so a wait has an identity even without a question. It outlives the
@@ -437,6 +442,9 @@ export const runRecordSchema = z.object({
    *  namer result may replace it). Missing on old runs = legacy behavior (auto
    *  fills only an unset titleSummary). Precedence: user > marker > auto. */
   titleOrigin: z.enum(['user', 'auto', 'marker']).optional(),
+  /** Set once the live refresh has fired: a task's title is refreshed from turn
+   *  context at most once, then stays put so the user can find it again. */
+  titleSettled: z.boolean().optional(),
   /** References the agent itself declared via `CEZ:PR=` / `CEZ:ISSUE=` markers
    *  (spec 2026-07-18-task-ref-markers). Presence of a kind makes it
    *  authoritative: the namer may no longer write that kind, and a declared PR

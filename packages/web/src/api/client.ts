@@ -218,6 +218,7 @@ import type { ResponseFormat } from 'hono/types'
 import type { AppType } from '@open-mercato/cezar/app-type'
 import { SID_HEADER, sid, uuidv7 } from '@/lib/sid'
 import { noteFailedRequest } from '@/lib/failed-request'
+import { BUILD_HEADER, noteServerBuild } from '@/lib/build-identity'
 
 /**
  * The cockpit's client for its own HTTP API.
@@ -486,6 +487,7 @@ async function fetchOrThrow(url: string, init?: RequestInit): Promise<Response> 
     const headers = new Headers(init?.headers)
     headers.set(SID_HEADER, sid())
     const res = await fetch(url, { ...init, headers, credentials: 'include' })
+    noteServerBuild(res.headers?.get(BUILD_HEADER) ?? null)
     if (!res.ok) noteFailedRequest(url, init?.method, res.status, init?.body)
     return res
   } catch (cause) {
@@ -1652,6 +1654,7 @@ export async function cancelRun(id: string): Promise<CancelResponse> {
   return unwrap(
     await cez.api.v1.p[':projectId'].runs[':id'].cancel.$post({
       param: { projectId: queryScope(), id: encodeURIComponent(id) },
+      json: {},
     }),
     runPath(id, '/cancel'),
   )
@@ -3191,6 +3194,64 @@ export async function getRunTerminalCommands(id: string): Promise<DiscoveredComm
       param: { projectId: queryScope(), id: encodeURIComponent(id) },
     }),
     runPath(id, '/terminal/commands'),
+  )
+}
+
+/* ── The project terminal (#1526): the same shells, opened in the project root ──────────────── */
+
+export async function getProjectTerminal(): Promise<TerminalState> {
+  return unwrap(await cez.api.v1.p[':projectId'].terminal.$get({ param: { projectId: queryScope() } }), '/terminal')
+}
+
+export async function createProjectTerminal(body: TerminalCreateInput): Promise<TerminalSession> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].terminal.$post({ param: { projectId: queryScope() }, json: body }),
+    '/terminal',
+  )
+}
+
+export async function readProjectTerminal(sessionId: string, cursor: number): Promise<TerminalOutput> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].terminal[':sessionId'].output.$get({
+      param: { projectId: queryScope(), sessionId },
+      query: { cursor: String(cursor) },
+    }),
+    `/terminal/${sessionId}/output`,
+  )
+}
+
+export async function writeProjectTerminal(sessionId: string, data: string): Promise<void> {
+  await unwrap(
+    await cez.api.v1.p[':projectId'].terminal[':sessionId'].input.$post({
+      param: { projectId: queryScope(), sessionId },
+      json: { data },
+    }),
+    `/terminal/${sessionId}/input`,
+  )
+}
+
+export async function resizeProjectTerminal(sessionId: string, cols: number, rows: number): Promise<void> {
+  await unwrap(
+    await cez.api.v1.p[':projectId'].terminal[':sessionId'].resize.$post({
+      param: { projectId: queryScope(), sessionId },
+      json: { cols, rows },
+    }),
+    `/terminal/${sessionId}/resize`,
+  )
+}
+
+export async function stopProjectTerminal(sessionId: string): Promise<void> {
+  await unwrap(
+    await cez.api.v1.p[':projectId'].terminal[':sessionId'].$delete({ param: { projectId: queryScope(), sessionId } }),
+    `/terminal/${sessionId}`,
+  )
+}
+
+/** Commands the project root defines, each with the file it came from. */
+export async function getProjectTerminalCommands(): Promise<DiscoveredCommandsResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].terminal.commands.$get({ param: { projectId: queryScope() } }),
+    '/terminal/commands',
   )
 }
 

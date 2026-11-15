@@ -102,7 +102,8 @@ import {
 } from '../git-worktree.ts';
 import { commentOnIssue, commentOnPr, fetchPrHeadChecks, fetchPrWatchFingerprint, updatePr } from '../server/forge/github.ts';
 import { createDraftPr } from '../server/pr.ts';
-import { createOrSwitchBranch } from '../server/git-changes.ts';
+import { baseDivergence, createOrSwitchBranch } from '../server/git-changes.ts';
+import { isReadOnlyWorkflow, readOnlyWorkflowRefusal } from './capabilities.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows, newerCatalogWorkflow } from './load.ts';
 import type { QueuedMessage, RunRecord, RunStore, StepState } from '../runs/store.ts';
@@ -1814,6 +1815,7 @@ export class RunManager {
     this.startNowRequested.clear();
     this.memoryPausing.clear();
     this.lastNamerKey.clear();
+    this.namerInFlight.clear();
   }
 
   /**
@@ -4537,6 +4539,8 @@ export class RunManager {
 
   /** Last live-refresh namer inputs per run — unchanged inputs skip the call. */
   private lastNamerKey = new Map<string, string>();
+  /** The live-refresh namer call still pending per run — one at a time (#1252). */
+  private namerInFlight = new Map<string, Promise<unknown>>();
 
   /**
    * Acquire the one-at-a-time lease for runs executing in `repoRoot`.
@@ -5797,6 +5801,8 @@ export class RunManager {
         this.store.setLiveUsage(runId, event.status);
         return;
       }
+      // A manager's connector list; a task's transcript has no use for it.
+      if (event.type === 'mcp-servers') return;
       if (resumeGuard.hold(event)) {
         if (sessionError === undefined && event.type === 'error') {
           sessionError = event.message;
@@ -6123,8 +6129,16 @@ export class RunManager {
     }
     this.store.updateStep(runId, stepId, { profileId: continueProfile.profileId });
 
+    if (!state.enforceReadOnly) {
+      const refusal = readOnlyWorkflowRefusal(record?.workflowDef, continueBackend);
+      if (refusal) {
+        failBeforeSpawn(refusal);
+        return;
+      }
+    }
+    const continuePrivateMcp = !record?.workflowDef || !isReadOnlyWorkflow(record.workflowDef);
     const runner = createRunner(continueBackend);
-    const continueMcp = await this.privateMcpForLaunch(continueBackend, onEvent);
+    const continueMcp = continuePrivateMcp ? await this.privateMcpForLaunch(continueBackend, onEvent) : [];
     if (state.cancelled) return;
     state.currentStepId = stepId;
     this.beginUsageInvocation(runId, state, stepId);
@@ -7414,6 +7428,17 @@ export class RunManager {
           note(`draft PR already open: ${run.pullRequestUrl}`);
           return 'created';
         }
+        // Nothing to propose — a clean tree with no commits ahead of the base (a review-only
+        // run): succeed without pushing, rather than fail on gh's refusal.
+        if (
+          run.worktreePath &&
+          (await worktreeChangedPaths(run.worktreePath)).length === 0 &&
+          (await baseDivergence(run.worktreePath, run.baseBranch)).ahead === 0
+        ) {
+          outputs.set(node.id, { url: '', number: '' });
+          note('no commits ahead of the base branch — no PR opened');
+          return 'nothing';
+        }
         const title = node.title ? render(node.title) : undefined;
         const outcome = await createDraftPr({
           repoRoot: this.repoRoot,
@@ -8133,6 +8158,8 @@ export class RunManager {
         this.store.setLiveUsage(runId, event.status);
         return;
       }
+      // A manager's connector list; a task's transcript has no use for it.
+      if (event.type === 'mcp-servers') return;
       if (resumeGuard.hold(event)) {
         if (sessionError === undefined && event.type === 'error') {
           sessionError = event.message;
@@ -8453,8 +8480,15 @@ export class RunManager {
     }
     this.store.updateStep(runId, step.id, { profileId: stepProfile.profileId });
 
+    // A read-only workflow is only as read-only as the backend holding its tool limits.
+    const stepDef = this.store.getRun(runId)?.workflowDef;
+    if (!state.enforceReadOnly) {
+      const refusal = readOnlyWorkflowRefusal(stepDef, stepBackend);
+      if (refusal) return refusal;
+    }
+    const stepPrivateMcp = !stepDef || !isReadOnlyWorkflow(stepDef);
     const runner = createRunner(stepBackend);
-    const stepMcp = await this.privateMcpForLaunch(stepBackend, onEvent);
+    const stepMcp = stepPrivateMcp ? await this.privateMcpForLaunch(stepBackend, onEvent) : [];
     let session: AgentSession;
     state.currentStepId = step.id;
     this.beginUsageInvocation(runId, state, step.id);
@@ -8859,6 +8893,8 @@ export class RunManager {
       this.store.updateRun(runId, {
         titleSummary: result.titleSummary,
         titleOrigin: 'auto',
+        // The live refresh settles only once it really renamed: a failed namer retries next turn.
+        ...(live ? { titleSettled: true } : {}),
         ...(result.prNumber !== undefined && run.markerRefs?.pr === undefined
           ? { prNumber: result.prNumber }
           : {}),
@@ -8934,7 +8970,7 @@ export class RunManager {
           else this.store.appendEvent(runId, { type: 'note', message: 'diff stat unavailable — git diff --shortstat failed in the worktree' });
         }
       }
-      await this.maybeRefreshTitle(runId, turnText);
+      await this.maybeRefreshTitle(runId, turnText, owner);
     } catch {
       // Bookkeeping only — nothing here may disturb the run.
     }
@@ -8947,21 +8983,23 @@ export class RunManager {
    * like `CEZ:DONE` — never from tool output. Declared numbers overwrite the
    * regex/namer display tier (the store re-resolves the referenced-PR chip);
    * a declared title takes `titleOrigin: 'marker'`, which beats the namer but
-   * never a user rename, and silences the live refresh below.
+   * never a user rename, and silences the live refresh below. The first
+   * declared title sticks, and none applies once the title settled: a long
+   * task that moves between topics keeps the name the user learned to look for.
    */
   private applyTurnMarkers(runId: string, run: RunRecord, turnText: string): void {
     const markers = parseTaskMarkers(turnText);
     if (markers.pr !== undefined || markers.issue !== undefined) {
       this.store.applyMarkerRefs(runId, { pr: markers.pr, issue: markers.issue });
     }
-    if (markers.title && run.titleOrigin !== 'user') {
+    if (markers.title && run.titleOrigin !== 'user' && run.titleOrigin !== 'marker' && !run.titleSettled) {
       const current = this.store.getRun(runId);
       const refNumber = current?.prNumber ?? current?.issueNumber;
       const validated = postValidateTitle(markers.title, refNumber);
       // Same junk guard as composeNameResult: a declaration that validates to
       // nothing (or to a bare number prefix) must not blank the title.
       if (validated && validated !== `${refNumber}:`) {
-        this.store.updateRun(runId, { titleSummary: validated, titleOrigin: 'marker' });
+        this.store.updateRun(runId, { titleSummary: validated, titleOrigin: 'marker', titleSettled: true });
       }
     }
   }
@@ -8971,22 +9009,33 @@ export class RunManager {
    * the turn's context. Skips: toggle off (`liveTitleUpdates` config over
    * `CEZ_TITLE_UPDATES` env, default ON), user-owned title, marker-owned title
    * (the agent declares via `CEZ:TITLE` — the token-saving fast path), dry-run
-   * mocks (canned answers add nothing), empty turn text, unchanged namer inputs.
+   * mocks (canned answers add nothing), empty turn text, unchanged namer inputs,
+   * a namer call still in flight, and a title that already settled: the refresh
+   * renames once per task, so a long session that wanders across topics does
+   * not keep renaming itself (#1252).
    */
-  private async maybeRefreshTitle(runId: string, turnText: string): Promise<void> {
+  private async maybeRefreshTitle(runId: string, turnText: string, owner?: ActiveRun): Promise<void> {
     if (!autoNamingActive()) return;
     if (!turnText.trim()) return;
     const config = await loadConfig(this.repoRoot);
     if (!liveTitleUpdatesEnabled(config)) return;
     const run = this.store.getRun(runId);
-    if (!run || run.titleOrigin === 'user' || run.titleOrigin === 'marker') return;
+    if (!run || run.titleOrigin === 'user' || run.titleOrigin === 'marker' || run.titleSettled) return;
+    if (this.namerInFlight.has(runId)) return;
     const statText = run.diffStat ? `${run.diffStat.files} files, +${run.diffStat.adds} -${run.diffStat.dels}` : undefined;
     const key = `${turnText.slice(0, 200)}|${statText ?? ''}`;
     if (this.lastNamerKey.get(runId) === key) return;
     this.lastNamerKey.set(runId, key);
-    const workflow = await this.reviveWorkflow(run);
-    const skillName = workflow?.steps.find((s) => stepKind(s) === 'agent' && s.skill)?.skill?.trim();
-    void this.autoNameRun(runId, skillName, run.task, { turnText, diffStat: statText });
+    const pending = (async () => {
+      const workflow = await this.reviveWorkflow(run);
+      // A superseded session must not spend this run's one refresh.
+      if (owner && this.active.get(runId) !== owner) return;
+      const skillName = workflow?.steps.find((s) => stepKind(s) === 'agent' && s.skill)?.skill?.trim();
+      await this.autoNameRun(runId, skillName, run.task, { turnText, diffStat: statText });
+    })()
+      .catch(() => undefined)
+      .finally(() => this.namerInFlight.delete(runId));
+    this.namerInFlight.set(runId, pending);
   }
 
   /**

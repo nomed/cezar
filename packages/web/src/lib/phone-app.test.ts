@@ -1,7 +1,7 @@
 import type { ProjectsResponse } from '@open-mercato/cezar-api-client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { isCezarShell, isPhone, lastProjectIndex, showsBottomBar } from './phone-app'
+import { isCezarShell, isPhone, lastProjectIndex, phoneLanding, showsBottomBar, type PhoneLandingInput } from './phone-app'
 
 const REGISTRY = {
   projects: [
@@ -48,6 +48,8 @@ describe('showsBottomBar', () => {
     ['the shell, whose webview is not display-mode standalone', { userAgent: 'x CezarMobile/0.1 (ios)' }, true],
     ['a desktop PWA', { coarse: false, width: 1440, height: 900, standalone: true }, false],
     ['a tablet PWA', { width: 744, height: 1133, standalone: true }, false],
+    ['a tablet browser tab', { width: 834, height: 1194 }, false],
+    ['the shell on an iPad', { width: 834, height: 1194, userAgent: 'x CezarMobile/0.1 (ios)' }, true],
   ])('%s', (_case, input, expected) => {
     device(input)
     expect(showsBottomBar()).toBe(expected)
@@ -88,5 +90,27 @@ describe('lastProjectIndex', () => {
 
   it('is the bare root before anything is known', () => {
     expect(lastProjectIndex(remembered, undefined, undefined)).toBe('/')
+  })
+})
+
+describe('phoneLanding', () => {
+  const ready: PhoneLandingInput = {
+    health: { capabilities: { managers: true } },
+    healthFailed: false,
+    registry: REGISTRY,
+    registryFailed: false,
+    providers: { providers: [{ provider: 'claude', status: 'connected' }] },
+    providersFailed: false,
+    agentCheckSkipped: undefined,
+    uiStateFailed: false,
+  }
+
+  it('lands on Manager from a signed-in agent without waiting on ui-state', () => {
+    expect(phoneLanding(ready)).toBe('manager')
+  })
+
+  it('still waits on ui-state while no agent is signed in', () => {
+    expect(phoneLanding({ ...ready, providers: { providers: [] } })).toBe('wait')
+    expect(phoneLanding({ ...ready, providers: { providers: [] }, agentCheckSkipped: true })).toBe('manager')
   })
 })

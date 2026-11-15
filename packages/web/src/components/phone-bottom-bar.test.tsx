@@ -1,21 +1,22 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import * as React from 'react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { queryKeys, workspaceQueryKeys } from '@/api/queries'
 import { LAST_LOCATION_STORAGE_KEY } from '@/lib/last-location'
 
-import { AppShell, type AppShellProps } from './app-shell'
+import { AppShell, useShellTasksTab, type AppShellProps } from './app-shell'
 import { ThemeProvider } from './theme-provider'
 
-function device({ standalone = true, userAgent = 'Mozilla/5.0' } = {}) {
+function device({ standalone = true, userAgent = 'Mozilla/5.0', width = 390, height = 844 } = {}) {
   vi.stubGlobal('matchMedia', (query: string) => ({
     matches: query === '(pointer: coarse)' || (query === '(display-mode: standalone)' && standalone),
     addEventListener: () => {},
     removeEventListener: () => {},
   }))
-  vi.stubGlobal('screen', { width: 390, height: 844 })
+  vi.stubGlobal('screen', { width, height })
   vi.stubGlobal('navigator', { ...navigator, userAgent })
 }
 
@@ -32,7 +33,7 @@ function renderShell(entry: string, props: Partial<AppShellProps> = {}) {
       <ThemeProvider>
         <MemoryRouter initialEntries={[entry]}>
           <AppShell managersAvailable {...props}>
-            <input aria-label="field" />
+            {props.children ?? <input aria-label="field" />}
           </AppShell>
         </MemoryRouter>
       </ThemeProvider>
@@ -49,21 +50,59 @@ afterEach(() => {
 })
 
 describe('PhoneBottomBar', () => {
-  it('leads to Manager and the last project index in a phone PWA', () => {
+  it('leads Now, Tasks and New task into the last project, then Manager, in a phone PWA', () => {
     device()
     localStorage.setItem(LAST_LOCATION_STORAGE_KEY, JSON.stringify({ projectId: 'other', pathname: '/p/other/git' }))
-    renderShell('/manager')
+    renderShell('/manager/m-1')
     const links = within(bar()!)
-    expect(links.getByRole('link', { name: 'Manager' }).getAttribute('href')).toBe('/manager')
-    expect(links.getByRole('link', { name: 'Manager' }).getAttribute('aria-current')).toBe('page')
-    expect(links.getByRole('link', { name: 'Tasks' }).getAttribute('href')).toBe('/p/other/')
+    expect(links.getAllByRole('link').map((a) => a.getAttribute('aria-label') ?? a.textContent)).toEqual(['Now', 'Tasks', 'New task', 'Manager'])
+    expect(links.getByRole('link', { name: 'Now' }).getAttribute('href')).toBe('/p/other/')
+    expect(links.getByRole('link', { name: 'Tasks' }).getAttribute('href')).toBe('/p/other/tasks')
+    expect(links.getByRole('link', { name: 'New task' }).getAttribute('href')).toBe('/p/other/new')
+    // Inside Manager the tab is current and leads back to the list, like a tab bar.
+    const manager = links.getByRole('link', { name: 'Manager' })
+    expect(manager.getAttribute('aria-current')).toBe('page')
+    expect(manager.getAttribute('href')).toBe('/manager?all=1')
+    expect(links.queryByRole('link', { name: 'Git' })).toBeNull()
   })
 
-  it('points Tasks at the project on screen, ahead of the stored one', () => {
+  it('leads Manager to the remembered chat from a project, with its attention dot', () => {
+    device()
+    renderShell('/p/boot/', { managerTo: '/manager/m-2', managerAttention: 'needs-you' })
+    const manager = within(bar()!).getByRole('link', { name: /^Manager/ })
+    expect(manager.getAttribute('href')).toBe('/manager/m-2')
+    expect(manager.getAttribute('aria-current')).toBeNull()
+    expect(manager.querySelector('[data-slot="bottom-bar-attention"]')?.textContent).toBe(', needs you')
+    cleanup()
+    renderShell('/p/boot/', { managerTo: '/manager/m-2' })
+    expect(bar()!.querySelector('[data-slot="bottom-bar-attention"]')).toBeNull()
+  })
+
+  it('points every item at the project on screen, ahead of the stored one, and lights the area', () => {
     device()
     localStorage.setItem(LAST_LOCATION_STORAGE_KEY, JSON.stringify({ projectId: 'other', pathname: '/p/other/git' }))
-    renderShell('/p/boot/git')
-    expect(within(bar()!).getByRole('link', { name: 'Tasks' }).getAttribute('href')).toBe('/p/boot/')
+    renderShell('/p/boot/tasks/')
+    const links = within(bar()!)
+    expect(links.getByRole('link', { name: 'Now' }).getAttribute('href')).toBe('/p/boot/')
+    expect(links.getByRole('link', { name: 'Now' }).getAttribute('aria-current')).toBeNull()
+    expect(links.getByRole('link', { name: 'Manager' }).getAttribute('aria-current')).toBeNull()
+    cleanup()
+    renderShell('/p/boot/')
+    expect(within(bar()!).getByRole('link', { name: 'Now' }).getAttribute('aria-current')).toBe('page')
+    cleanup()
+    renderShell('/p/boot/tasks')
+    expect(within(bar()!).getByRole('link', { name: 'Tasks' }).getAttribute('aria-current')).toBe('page')
+  })
+
+  it('renders New task as the primary centre item', () => {
+    device()
+    renderShell('/p/boot/')
+    const newTask = within(bar()!).getByRole('link', { name: 'New task' })
+    expect(newTask.dataset.slot).toBe('bottom-bar-new-task')
+    expect(newTask.querySelector('.bg-primary')).not.toBeNull()
+    const items = [...bar()!.children]
+    expect(items.indexOf(newTask)).toBe(2)
+    expect(items).toHaveLength(5)
   })
 
   it('stays out of a phone browser tab', () => {
@@ -91,7 +130,7 @@ describe('PhoneBottomBar', () => {
     expect(bar()).not.toBeNull()
   })
 
-  it('needs the Manager capability: its first item would bounce otherwise', () => {
+  it('keeps its Manager-capability gate', () => {
     device()
     renderShell('/p/boot/', { managersAvailable: false })
     expect(bar()).toBeNull()
@@ -113,16 +152,11 @@ describe('PhoneBottomBar', () => {
     expect(screen.getByRole('button', { name: 'Open menu' })).toBeTruthy()
   })
 
-  it('stays on the global Tasks page, which is not a thread', () => {
+  it('stays on the global Tasks page, which is not a thread, and lights nothing there', () => {
     device()
     renderShell('/tasks')
     expect(bar()).not.toBeNull()
-  })
-
-  it('carries the attention dot, where the menu button only does in Tasks mode', () => {
-    device()
-    renderShell('/manager', { managerAttention: 'needs-you' })
-    expect(bar()!.querySelector('[data-slot="bottom-bar-attention"] span')?.className).toContain('bg-pending')
+    expect(within(bar()!).queryAllByRole('link', { current: 'page' })).toHaveLength(0)
   })
 
   it('hides while the keyboard is open', () => {
@@ -140,23 +174,98 @@ describe('PhoneBottomBar', () => {
     expect(bar()).toBeNull()
   })
 
-  it('More opens the drawer with Settings in Manager mode', () => {
+  it('More opens the drawer, which carries Git, Settings and the Projects | Manager switch', () => {
     device({ userAgent: 'x CezarMobile/0.1 (android)' })
-    renderShell('/manager')
+    renderShell('/p/boot/', { managerTo: '/manager/m-2' })
     fireEvent.click(within(bar()!).getByRole('button', { name: 'More' }))
     const drawer = document.querySelector<HTMLElement>('[data-slot="mobile-nav-drawer"]')!
-    expect(within(drawer).getByRole('link', { name: 'Global settings' })).toBeTruthy()
+    expect(within(drawer).getByRole('link', { name: 'Settings' })).toBeTruthy()
+    expect(within(drawer).getByRole('link', { name: 'Git' })).toBeTruthy()
+    const modes = within(drawer.querySelector<HTMLElement>('[data-slot="mode-switch"]')!)
+    expect(modes.getByRole('link', { name: 'Manager' }).getAttribute('href')).toBe('/manager/m-2')
+    expect(modes.getByRole('link', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
   })
 
-  it('leads Manager back to the chat this tab left, and to the list from inside a chat', () => {
+  it('in Manager, the drawer leads with the switch and lists the managers, while the tab stays', () => {
+    device({ userAgent: 'x CezarMobile/0.1 (android)' })
+    renderShell('/manager/m-1', { managerSidebar: <p>manager rows</p> })
+    expect(within(bar()!).getByRole('link', { name: 'Manager' }).getAttribute('aria-current')).toBe('page')
+    fireEvent.click(within(bar()!).getByRole('button', { name: 'More' }))
+    const drawer = document.querySelector<HTMLElement>('[data-slot="mobile-nav-drawer"]')!
+    const modes = within(drawer.querySelector<HTMLElement>('[data-slot="mode-switch"]')!)
+    expect(modes.getByRole('link', { name: 'Manager' }).getAttribute('aria-current')).toBe('page')
+    expect(within(drawer).getByText('manager rows')).toBeTruthy()
+    expect(within(drawer).queryByRole('link', { name: 'Git' })).toBeNull()
+  })
+
+  it('paints the tab dot in the attention grammar: blue needs you, violet unread', () => {
     device()
-    renderShell('/p/boot/', { managerTo: '/manager/m-2' })
-    expect(within(bar()!).getByRole('link', { name: 'Manager' }).getAttribute('href')).toBe('/manager/m-2')
+    renderShell('/p/boot/', { managerAttention: 'needs-you' })
+    expect(bar()!.querySelector('[data-slot="bottom-bar-attention"] span')?.className).toContain('bg-info')
     cleanup()
-    renderShell('/manager/m-2', { managerTo: '/manager/m-2' })
-    expect(within(bar()!).getByRole('link', { name: 'Manager' }).getAttribute('href')).toBe('/manager?all=1')
-    cleanup()
-    renderShell('/manager?all=1')
-    expect(within(bar()!).getByRole('link', { name: 'Manager' }).getAttribute('href')).toBe('/manager?all=1')
+    renderShell('/p/boot/', { managerAttention: 'unread' })
+    expect(bar()!.querySelector('[data-slot="bottom-bar-attention"] span')?.className).toContain('bg-violet')
+  })
+
+  describe('on an iPad in CezarBot', () => {
+    const IPAD = { standalone: false, userAgent: 'x CezarMobile/0.1 (ios)', width: 834, height: 1194 }
+    const sidebar = () => document.querySelector('[data-slot="sidebar"], [data-slot="sidebar-rail"]')
+    const column = () => document.querySelector<HTMLElement>('[data-slot="main-column"]')!
+
+    it('is the navigation at every width: no sidebar, and More opens the drawer', () => {
+      device(IPAD)
+      renderShell('/manager/m-1', { managerSidebar: <p>manager rows</p> })
+      expect(bar()).not.toBeNull()
+      expect(bar()!.className).not.toContain('md:hidden')
+      expect(sidebar()).toBeNull()
+      expect(document.querySelector('[data-slot="app-shell"]')!.hasAttribute('data-phone-nav')).toBe(true)
+      fireEvent.click(within(bar()!).getByRole('button', { name: 'More' }))
+      const drawer = document.querySelector<HTMLElement>('[data-slot="mobile-nav-drawer"]')!
+      expect(drawer.className).not.toContain('md:hidden')
+      expect(within(drawer).getByText('manager rows')).toBeTruthy()
+    })
+
+    it('pads the status bar above the column, where no phone header does', () => {
+      device(IPAD)
+      renderShell('/manager/m-1')
+      expect(column().className).toContain('md:pt-[env(safe-area-inset-top)]')
+    })
+
+    it('keeps the menu in a thread, where the bar steps aside', () => {
+      device(IPAD)
+      renderShell('/p/boot/tasks/run-1')
+      expect(bar()).toBeNull()
+      const top = document.querySelector<HTMLElement>('[data-slot="mobile-top-bar"]')!
+      expect(top.className).not.toContain('md:hidden')
+      expect(column().className).not.toContain('md:pt-[env(safe-area-inset-top)]')
+    })
+
+    it("a manager chat's Tasks opens its own tasks, with the count", () => {
+      device(IPAD)
+      const open = vi.fn()
+      function Chat() {
+        const publish = useShellTasksTab()
+        React.useEffect(() => {
+          publish?.publish({ count: 4, expanded: false, open })
+          return () => publish?.publish(null)
+        }, [publish])
+        return null
+      }
+      renderShell('/manager/m-1', { children: <Chat /> })
+      const tasks = within(bar()!).getByRole('button', { name: 'Tasks, 4 started by this manager' })
+      expect(tasks.textContent).toContain('4')
+      expect(within(bar()!).queryByRole('link', { name: 'Tasks' })).toBeNull()
+      fireEvent.click(tasks)
+      expect(open).toHaveBeenCalledOnce()
+    })
+  })
+
+  it('a desktop browser keeps the sidebar and no bar', () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }))
+    vi.stubGlobal('screen', { width: 1280, height: 800 })
+    renderShell('/manager/m-1')
+    expect(bar()).toBeNull()
+    expect(document.querySelector('[data-slot="sidebar"], [data-slot="sidebar-rail"]')).not.toBeNull()
+    expect(document.querySelector('[data-slot="app-shell"]')!.hasAttribute('data-phone-nav')).toBe(false)
   })
 })
