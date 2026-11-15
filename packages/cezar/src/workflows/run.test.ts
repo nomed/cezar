@@ -15,6 +15,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { removeTempDir } from '../test-fixtures/remove-temp-dir.testkit.ts';
 import type { ContentBlock } from '../core/agent-runner.ts';
 import { parseAskMarker } from '../core/ask.ts';
+import { createCodexUiState, mapCodexNotification } from '../core/codex-ui-mapper.ts';
 import type { UiEvent } from '../core/ui-events.ts';
 import { ClaudeCliRunner } from '../core/claude-cli-runner.ts';
 import { createWorktree, removeWorktree } from '../git-worktree.ts';
@@ -148,6 +149,25 @@ describe('RunManager directional usage accounting', () => {
     return { run, state, sink };
   }
 
+  function codexFixture() {
+    const { run, state, sink } = fixture();
+    internal.beginUsageInvocation(run.id, state, 'work');
+    let mapper = createCodexUiState();
+    const deliver = (method: string, params: Record<string, unknown>) => {
+      const mapped = mapCodexNotification({ method, params }, mapper);
+      mapper = mapped.state;
+      for (const event of mapped.events) internal.handleRunnerUiEvent(run.id, state, sink, event);
+    };
+    const usage = (turnId: string, input: number, cache?: number) =>
+      deliver('thread/tokenUsage/updated', { turnId, tokenUsage: {
+        total: { inputTokens: input, outputTokens: 0,
+          ...(cache !== undefined ? { cachedInputTokens: cache } : {}) },
+        last: { inputTokens: input, outputTokens: 0,
+          ...(cache !== undefined ? { cachedInputTokens: cache } : {}) },
+      } });
+    return { run, deliver, usage };
+  }
+
   it('deduplicates starts and completions while summing multiple turns in one invocation', () => {
     const { run, state, sink } = fixture();
     internal.beginUsageInvocation(run.id, state, 'work');
@@ -179,6 +199,124 @@ describe('RunManager directional usage accounting', () => {
       outputTokens: 3,
     });
     expect(store.getRun(run.id)).toMatchObject({ inputTokens: 15, outputTokens: 3 });
+  });
+
+  it('persists cached input only with complete turn coverage and never adds it to input again', () => {
+    const { run, state, sink } = fixture();
+    internal.beginUsageInvocation(run.id, state, 'work');
+    internal.handleRunnerUiEvent(run.id, state, sink, { type: 'turn.started', turnId: 't1' });
+    const measured: UiEvent = { type: 'turn.completed', turnId: 't1', stopReason: 'end_turn',
+      usage: { input: 100, output: 20, total: 120, cacheRead: 40 } };
+    internal.handleRunnerUiEvent(run.id, state, sink, { type: 'usage.updated', turnId: 't1',
+      turnUsage: { input: 100, output: 20, total: 120, cacheRead: 40 },
+      usage: { input: 100, output: 20, total: 120, cacheRead: 40 } });
+    internal.handleRunnerUiEvent(run.id, state, sink, measured);
+    internal.handleRunnerUiEvent(run.id, state, sink, measured);
+    expect(store.getRun(run.id)).toMatchObject({ inputTokens: 100, outputTokens: 20, cachedInputTokens: 40 });
+    store.flush();
+    expect(RunStore.open(join(repoRoot, '.ai/cezar')).getRun(run.id)?.cachedInputTokens).toBe(40);
+    internal.handleRunnerUiEvent(run.id, state, sink, { type: 'turn.started', turnId: 't2' });
+    internal.handleRunnerUiEvent(run.id, state, sink, { type: 'turn.completed', turnId: 't2', stopReason: 'end_turn',
+      usage: { input: 10, output: 2, total: 12 } });
+    expect(store.getRun(run.id)).toMatchObject({ inputTokens: 110, outputTokens: 22 });
+    expect(store.getRun(run.id)?.cachedInputTokens).toBeUndefined();
+  });
+
+  it('reconciles a late completed Codex turn into complete persisted totals', () => {
+    const { run, deliver, usage } = codexFixture();
+    deliver('turn/started', { turn: { id: 't1' } });
+    usage('t1', 100, 50);
+    deliver('turn/completed', { turn: { id: 't1' } });
+    deliver('turn/started', { turn: { id: 't2' } });
+    usage('t1', 150, 75);
+    usage('t1', 150, 75); // repeated notification
+    usage('t2', 200, 100);
+    deliver('turn/completed', { turn: { id: 't2' } });
+    expect(store.getRun(run.id)?.steps[0]).toMatchObject({
+      inputTokens: 200, outputTokens: 0, cachedInputTokens: 100,
+      usageTurnsStarted: 2, usageTurnsRecorded: 2, usageCacheTurnsRecorded: 2,
+    });
+    expect(store.getRun(run.id)).toMatchObject({ inputTokens: 200, cachedInputTokens: 100 });
+    store.flush();
+    expect(RunStore.open(join(repoRoot, '.ai/cezar')).getRun(run.id)).toMatchObject({
+      inputTokens: 200, cachedInputTokens: 100,
+    });
+  });
+
+  it('corrects an older completed turn after a newer turn has closed', () => {
+    const { run, deliver, usage } = codexFixture();
+    deliver('turn/started', { turn: { id: 't1' } });
+    usage('t1', 100, 50);
+    deliver('turn/completed', { turn: { id: 't1' } });
+    deliver('turn/started', { turn: { id: 't2' } });
+    usage('t2', 150, 75);
+    deliver('turn/completed', { turn: { id: 't2' } });
+    usage('t1', 175, 85);
+    expect(store.getRun(run.id)).toMatchObject({ inputTokens: 175, cachedInputTokens: 85 });
+    deliver('turn/started', { turn: { id: 't3' } });
+    usage('t3', 200, 100);
+    deliver('turn/completed', { turn: { id: 't3' } });
+    expect(store.getRun(run.id)).toMatchObject({ inputTokens: 200, cachedInputTokens: 100 });
+    store.flush();
+    expect(RunStore.open(join(repoRoot, '.ai/cezar')).getRun(run.id)).toMatchObject({
+      inputTokens: 200, cachedInputTokens: 100,
+    });
+  });
+
+  it('keeps cache coverage absent until a missing late cache reading is reconciled', () => {
+    const { run, deliver, usage } = codexFixture();
+    deliver('turn/started', { turn: { id: 't1' } });
+    usage('t1', 100, 50);
+    deliver('turn/completed', { turn: { id: 't1' } });
+    usage('t1', 150);
+    expect(store.getRun(run.id)?.inputTokens).toBe(150);
+    expect(store.getRun(run.id)?.cachedInputTokens).toBeUndefined();
+    store.flush();
+    expect(RunStore.open(join(repoRoot, '.ai/cezar')).getRun(run.id)?.cachedInputTokens).toBeUndefined();
+    usage('t1', 150, 75);
+    expect(store.getRun(run.id)).toMatchObject({ inputTokens: 150, cachedInputTokens: 75 });
+    store.flush();
+    expect(RunStore.open(join(repoRoot, '.ai/cezar')).getRun(run.id)?.cachedInputTokens).toBe(75);
+  });
+
+  it('does not certify a complete aggregate for an unknown foreign turn', () => {
+    const { run, deliver, usage } = codexFixture();
+    deliver('turn/started', { turn: { id: 't1' } });
+    usage('t1', 100, 50);
+    deliver('turn/completed', { turn: { id: 't1' } });
+    usage('unknown-earlier-turn', 150, 75);
+    expect(store.getRun(run.id)?.steps[0]).toMatchObject({ usageAttributionIncomplete: true });
+    expect(store.getRun(run.id)?.inputTokens).toBeUndefined();
+    expect(store.getRun(run.id)?.cachedInputTokens).toBeUndefined();
+    store.flush();
+    expect(RunStore.open(join(repoRoot, '.ai/cezar')).getRun(run.id)?.inputTokens).toBeUndefined();
+  });
+
+  it('retains measured Codex usage through interruption and resume without claiming complete coverage', () => {
+    const { run, state, sink } = fixture();
+    internal.beginUsageInvocation(run.id, state, 'work');
+    internal.handleRunnerUiEvent(run.id, state, sink, { type: 'turn.started', turnId: 't1' });
+    const snapshot: UiEvent = { type: 'usage.updated', turnId: 't1',
+      turnUsage: { input: 100, output: 20, total: 120, cacheRead: 40 },
+      usage: { input: 100, output: 20, total: 120, cacheRead: 40 } };
+    internal.handleRunnerUiEvent(run.id, state, sink, snapshot);
+    internal.handleRunnerUiEvent(run.id, state, sink, snapshot);
+    state.cancelled = true;
+    internal.handleRunnerUiEvent(run.id, state, sink, { type: 'usage.updated', turnId: 't1',
+      turnUsage: { input: 150, output: 30, total: 180, cacheRead: 60 },
+      usage: { input: 150, output: 30, total: 180, cacheRead: 60 } });
+    expect(store.getRun(run.id)?.steps[0]).toMatchObject({ inputTokens: 150, outputTokens: 30,
+      cachedInputTokens: 60, usageTurnsStarted: 1, usageOpenTurn: { id: 't1', input: 150, output: 30, cacheRead: 60 } });
+    expect(store.getRun(run.id)?.inputTokens).toBeUndefined();
+    store.flush();
+    expect(RunStore.open(join(repoRoot, '.ai/cezar')).getRun(run.id)?.steps[0]?.inputTokens).toBe(150);
+    state.cancelled = false;
+    internal.beginUsageInvocation(run.id, state, 'work');
+    internal.handleRunnerUiEvent(run.id, state, sink, { type: 'turn.started', turnId: 't2' });
+    internal.handleRunnerUiEvent(run.id, state, sink, { type: 'turn.completed', turnId: 't2', stopReason: 'end_turn',
+      usage: { input: 10, output: 2, total: 12, cacheRead: 3 } });
+    expect(store.getRun(run.id)?.steps[0]).toMatchObject({ inputTokens: 160, outputTokens: 32, cachedInputTokens: 63 });
+    expect(store.getRun(run.id)?.inputTokens).toBeUndefined();
   });
 
   it('keeps the run aggregate absent after a pre-turn failure even when a later invocation is metered', () => {

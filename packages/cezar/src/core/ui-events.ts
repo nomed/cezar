@@ -375,6 +375,15 @@ export interface UiUsageUpdatedEvent {
   type: 'usage.updated';
   usage: TokenUsage;
   costUsd?: number;
+  /** Codex only: a measured per-turn snapshot accompanying the thread total.
+   * Repeated frames replace this snapshot; it is never a delta to add twice. */
+  turnId?: string;
+  turnUsage?: TokenUsage;
+  /** Codex only: positive cumulative increase measured for an already closed
+   * turn. This is a delta, not a replacement snapshot. */
+  turnCorrection?: { turnId: string; delta: TokenUsage };
+  /** A measured increase whose turn cannot safely be identified. */
+  attributionIncomplete?: true;
 }
 
 /**
