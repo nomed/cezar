@@ -36,6 +36,11 @@ import { diskFullAgentErrorText } from '../disk-space.ts';
 import { accountStateHint, classifyAgentFailure, isOauthRefreshRace, transientRetryCap, transientRetryDelayMs } from '../core/agent-failure-class.ts';
 import { reportAgentError } from '../runs/agent-error-telemetry.ts';
 import { createRunner } from '../core/runner-factory.ts';
+import { ProviderAuthService } from '../core/provider-auth.ts';
+import { createHostModelCatalog } from '../core/host-model-catalog.ts';
+import type { RunnerModelCatalog } from '../core/runner-model-catalog.ts';
+import { selectAdaptiveModel, shouldUseAdaptiveRouting, shouldEscalateFromChecks, type RoutingCandidate } from '../core/adaptive-model-router.ts';
+import { loadModelsDevMetadata, metadataForRunner } from '../core/models-dev-metadata.ts';
 import { REASONING_EFFORT_UNSUPPORTED_ERROR, runnerSupportsReasoningEffort, type RunnerId } from '../core/agent-runner.ts';
 import { modelConflictsWithRunner, pinSurvivesRunnerSwitch } from '../core/model-presets.ts';
 import { AGENT_MODELS_LOCKED_ERROR, agentModelsLocked } from '../core/agent-model-policy.ts';
@@ -206,6 +211,7 @@ import {
   type WorkflowGraph,
 } from './graph.ts';
 import { resolveContinuationModel } from './run-continuation-model.ts';
+import { graphAgentAffinity } from './graph-agent-affinity.ts';
 
 /** Backends whose runner honors `resume` (AgentRunSpec) — graph `session.continue` and the
  *  verdict nudge need it. OpenCode always starts a new session; Cursor has no resume yet; omp resumes
@@ -1595,6 +1601,9 @@ export class RunManager {
   /** See the constructor option of the same name. */
   private readonly prWatchProbe: PrWatchProbe;
 
+  private readonly routingCatalog: RunnerModelCatalog;
+  private routingAuth?: ProviderAuthService;
+
   /** Per-execution grants retained while a live session waits for follow-up. */
   private readonly trackerCapabilities = new Map<string, { epoch: unknown; tokens: Set<string> }>();
 
@@ -1624,11 +1633,14 @@ export class RunManager {
       branchNameWaitMs?: number;
       /** Reads a monitored PR's fingerprint (#2040); tests inject a fake forge. */
       prWatchProbe?: PrWatchProbe;
+      /** Native model discovery, injected for deterministic routing tests. */
+      modelCatalog?: RunnerModelCatalog;
     } = {},
   ) {
     this.dataDir = join(repoRoot, '.ai/cezar');
     this.branchNameWaitMs = options.branchNameWaitMs ?? BRANCH_NAME_WAIT_MS;
     this.prWatchProbe = options.prWatchProbe ?? fetchPrWatchFingerprint;
+    this.routingCatalog = options.modelCatalog ?? createHostModelCatalog(repoRoot);
     this.projectId = options.projectId;
     this.secrets = options.secrets ?? new SecretStore();
     this.semaphore = options.semaphore ?? new WorkspaceSemaphore();
@@ -2485,6 +2497,8 @@ export class RunManager {
     // it re-queues as a fresh continuation rather than reviving the workflow from the top.
     const reservedFallback = queuedContinuation !== undefined && run.fallbackEpisode?.current?.stepId === queuedContinuation.id;
     if (queuedContinuation && (sessionStep?.sessionId || reservedFallback)) {
+      // Continue (including a fallback successor) persisted its chosen runner
+      // before queueing. The prior session must not override an explicit switch.
       const backend = run.runner ?? 'claude';
       const sessionBackend = sessionStep?.backend ?? backend;
       // Same rule as `continueRun`: a session created under another account than the run's
@@ -3878,6 +3892,23 @@ export class RunManager {
     });
   }
 
+  /** Routing admits only providers the existing action gate would run now.
+   * A headless run has no server gate, so it uses the same native auth probe. */
+  private async routingProviderAllowed(provider: RunnerId): Promise<boolean> {
+    const workspace = await loadWorkspaceConfig().catch(() => undefined);
+    if (workspace?.disabledProviders?.includes(provider as ProviderId)) return false;
+    if (fallbackProviderCheck) {
+      try { return (await fallbackProviderCheck(provider as ProviderId, DEFAULT_AGENT_ACCOUNT_ID, this.repoRoot)) === null; }
+      catch { return false; }
+    }
+    try {
+      this.routingAuth ??= new ProviderAuthService({ cwd: this.repoRoot });
+      const row = (await this.routingAuth.status()).providers.find((candidate) => candidate.provider === provider);
+      return row?.status === 'connected' ||
+        (row?.status === 'unknown' && (provider === 'junie' || provider === 'antigravity'));
+    } catch { return false; }
+  }
+
   /** Why `provider`/`profileId` cannot take a task over right now, or null. Disabled providers are a
    *  settings fact checked here; sign-in state comes from the server's provider gate when present. */
   private async fallbackProviderRefusal(provider: RunnerId, profileId: string): Promise<string | null> {
@@ -4365,7 +4396,11 @@ export class RunManager {
     for (const run of this.store.listRuns()) {
       // A holding run always carries the runner it actually ran on, so the fallback is unused
       // here — it is spelled out rather than `!` so a future record shape degrades, not throws.
-      const key = () => runAccountKey(run, run.runner ?? 'claude', this.accountStore && { store: this.accountStore, repoRoot: this.repoRoot, holding: true });
+      const latestSession = [...run.steps].reverse().find((step) => step.sessionId);
+      const holdRunner = latestSession?.adaptiveRouted && latestSession.backend
+        ? latestSession.backend : run.runner ?? 'claude';
+      const key = () => runAccountKey({ ...run, runner: holdRunner }, holdRunner,
+        this.accountStore && { store: this.accountStore, repoRoot: this.repoRoot, holding: true });
       // A fallback's exhausted account stays held until ITS reset, whatever the task did since.
       for (const hold of run.usageLimitHolds ?? []) {
         const until = Date.parse(hold.until);
@@ -5324,7 +5359,8 @@ export class RunManager {
       const settledTurn = unwinding !== undefined && !unwinding.continueOnDrop && !this.starting.has(runId) && resumable
         && (unwinding.cancelled ? run.status === 'cancelled' : unwinding.turnSettled === true);
       if (!settledTurn) return { ok: false, error: 'run is still active' };
-      const runner = opts.runner ?? run.runner ?? 'claude';
+      const latestSession = [...run.steps].reverse().find((step) => step.sessionId);
+      const runner = opts.runner ?? (latestSession?.adaptiveRouted ? latestSession.backend : undefined) ?? run.runner ?? 'claude';
       if (opts.model && modelConflictsWithRunner(opts.model, runner)) {
         return { ok: false, error: `model '${opts.model}' is not a ${runner} model` };
       }
@@ -5345,7 +5381,7 @@ export class RunManager {
       }
       if (!internal.freshSessionAllowed) return { ok: false, error: 'no agent session to resume' };
     }
-    const targetRunner = opts.runner ?? run.runner ?? 'claude';
+    const targetRunner = opts.runner ?? (sessionStep?.adaptiveRouted ? sessionStep.backend : undefined) ?? run.runner ?? 'claude';
     // Session ids are provider-owned opaque values. New records carry explicit
     // affinity; for legacy records, the run's current runner is the conservative
     // owner until a continuation emits a new, attributed session id (#562).
@@ -5427,6 +5463,12 @@ export class RunManager {
             ? { agentProfile: undefined }
             : {}),
       });
+    }
+    // Routing is a recorded choice for this session, even when the composer
+    // sends no override. Make the run's active backend match before queueing so
+    // restart recovery and later Continue turns keep the same owner.
+    if (opts.runner === undefined && sessionStep?.adaptiveRouted && targetRunner !== (run.runner ?? 'claude')) {
+      this.store.updateRun(runId, { runner: targetRunner });
     }
 
     // Everything that could refuse this continuation has now passed, so a pending usage-limit
@@ -6848,7 +6890,12 @@ export class RunManager {
         if (rendered.prompt) rendered.prompt = renderNodeRefs(rendered.prompt, outputs);
         const verdicts = node.verdicts ?? [];
         if (verdicts.length) rendered.prompt = `${rendered.prompt ?? '{{task}}'}\n\n${verdictInstruction(verdicts)}`;
-        const backend = node.runner ?? taskBackend;
+        // A routed node owns the runner and model of its session. Reuse that
+        // affinity before graph restart and session.continue decide how to resume.
+        const affinity = graphAgentAffinity(node, this.store.getRun(runId), resuming);
+        if (affinity.runner) rendered.runner = affinity.runner;
+        if (affinity.model) rendered.model = affinity.model;
+        const backend = rendered.runner ?? taskBackend;
         const lastTurn = { text: '' };
         const failure = await this.runAgentStep(
           runId,
@@ -6867,12 +6914,26 @@ export class RunManager {
           resuming && ctx.usageLimitResume?.id === node.id
             ? {
                 ...(RESUMABLE_BACKENDS.has(backend) ? { resumeSessionId: ctx.usageLimitResume.sessionId } : {}),
+                recordedProfileId: ctx.usageLimitResume.profileId ?? DEFAULT_AGENT_ACCOUNT_ID,
+                adaptiveRouted: ctx.usageLimitResume.adaptiveRouted,
                 lastTurn,
                 usageLimitResume: ctx.usageLimitResume,
               }
             : resuming
               ? this.resumeInterruptedAgent(runId, node, backend, rendered, lastTurn)
-              : { resumeSessionId: this.graphResumeSession(runId, node, backend, emit), lastTurn },
+              : (() => {
+                  const resumeSessionId = this.graphResumeSession(runId, node, backend, emit);
+                  const owner = resumeSessionId
+                    ? this.store.getRun(runId)?.steps.find((entry) => entry.id === node.session?.continue)
+                    : undefined;
+                  // Persist session ownership before the runner starts. A
+                  // crash between graph selection and spawn must still make
+                  // Continue and account holds follow the actual provider.
+                  if (owner?.adaptiveRouted) this.store.updateStep(runId, node.id, { adaptiveRouted: true });
+                  return { resumeSessionId, lastTurn,
+                    ...(owner ? { recordedProfileId: owner.profileId ?? DEFAULT_AGENT_ACCOUNT_ID,
+                      adaptiveRouted: owner.adaptiveRouted } : {}) };
+                })(),
         );
         startImages = undefined;
         checkFailure = null;
@@ -6895,13 +6956,16 @@ export class RunManager {
         if (!failure && verdicts.length) {
           verdict = parseVerdict(lastTurn.text, verdicts);
           // D14: one nudge on the node's own session, then `failed`.
-          const own = this.store.getRun(runId)?.steps.find((s) => s.id === node.id)?.sessionId;
-          if (!verdict && own && RESUMABLE_BACKENDS.has(backend) && !state.cancelled) {
+          const owner = this.store.getRun(runId)?.steps.find((s) => s.id === node.id);
+          const own = owner?.sessionId;
+          const ownerBackend = owner?.backend ?? backend;
+          if (!verdict && own && RESUMABLE_BACKENDS.has(ownerBackend) && !state.cancelled) {
             emit({ type: 'note', stepId: node.id, message: 'no verdict marker — asking the agent once more' });
             const nudge = await this.runAgentStep(
               runId,
               state,
-              { ...rendered, prompt: `You did not end with a verdict. ${verdictInstruction(verdicts)}` },
+              { ...rendered, runner: ownerBackend, ...(owner?.model ? { model: owner.model } : {}),
+                prompt: `You did not end with a verdict. ${verdictInstruction(verdicts)}` },
               input,
               skills,
               null,
@@ -6912,7 +6976,9 @@ export class RunManager {
               extraSystemPrompt,
               undefined,
               [],
-              { resumeSessionId: own, lastTurn },
+              { resumeSessionId: own, lastTurn,
+                recordedProfileId: owner?.profileId ?? DEFAULT_AGENT_ACCOUNT_ID,
+                adaptiveRouted: owner?.adaptiveRouted },
             );
             if (state.cancelled) return null;
             if (!nudge) verdict = parseVerdict(lastTurn.text, verdicts);
@@ -7031,11 +7097,13 @@ export class RunManager {
     backend: RunnerId,
     rendered: WorkflowStepDef,
     lastTurn: { text: string },
-  ): { resumeSessionId?: string; lastTurn: { text: string } } {
-    const own = this.store.getRun(runId)?.steps.find((s) => s.id === node.id)?.sessionId;
-    if (!own || !RESUMABLE_BACKENDS.has(backend)) return { lastTurn };
+  ): { resumeSessionId?: string; recordedProfileId?: string; adaptiveRouted?: boolean; lastTurn: { text: string } } {
+    const owner = this.store.getRun(runId)?.steps.find((s) => s.id === node.id);
+    if (!owner?.sessionId || !RESUMABLE_BACKENDS.has(backend)) return { lastTurn };
     rendered.prompt = RESTART_CONTINUATION_PROMPT;
-    return { resumeSessionId: own, lastTurn };
+    return { resumeSessionId: owner.sessionId,
+      recordedProfileId: owner.profileId ?? DEFAULT_AGENT_ACCOUNT_ID,
+      adaptiveRouted: owner.adaptiveRouted, lastTurn };
   }
 
   /**
@@ -7841,9 +7909,70 @@ export class RunManager {
     /** Graph-workflow hooks (spec 2026-09-30-workflow-node-editor): reopen an earlier session
      *  instead of minting one, and hand back the last turn's text for verdict parsing.
      *  `usageLimitResume` reopens a step a usage limit interrupted (#1300). */
-    graphHooks?: { resumeSessionId?: string; lastTurn?: { text: string }; usageLimitResume?: StepState },
+    graphHooks?: { resumeSessionId?: string; recordedProfileId?: string; adaptiveRouted?: boolean;
+      lastTurn?: { text: string }; usageLimitResume?: StepState },
   ): Promise<string | null> {
     const resumeStep = graphHooks?.usageLimitResume;
+    // Routing happens before the first session of a step. A resumed session keeps
+    // its model and account; provider-limit fallback remains the existing engine path.
+    if (shouldUseAdaptiveRouting({
+      enabled: process.env.CEZ_MODEL_ROUTING === '1',
+      dryRun: process.env.CEZ_DRY_RUN === '1',
+      locked: agentModelsLocked(this.repoRoot),
+      taskModel: input.model,
+      stepModel: step.model,
+      accountPinned: Boolean(input.agentProfile),
+      resuming: Boolean(graphHooks?.resumeSessionId || resumeStep),
+      fallingBack: Boolean(this.store.getRun(runId)?.fallbackEpisode?.current),
+    }) && (await resolveProfileEnvForRoot(this.repoRoot, taskBackend)).profile.isDefault) {
+      const runners = ['claude', 'codex', 'opencode', 'junie', 'cursor', 'antigravity', 'kimi'] as const;
+      const catalogs = await Promise.all(runners.map((runner) => this.routingCatalog.get(runner)));
+      const metadata = await loadModelsDevMetadata();
+      const holds = this.semaphore.accountHolds();
+      const candidates: RoutingCandidate[] = (await Promise.all(catalogs.map(async (catalog) => {
+        const accountKey = `${catalog.runner}:${DEFAULT_AGENT_ACCOUNT_ID}`;
+        if (catalog.stale || catalog.source === 'unavailable' ||
+            holds.deadline.has(accountKey) || holds.inFlight.has(accountKey) ||
+            !(await resolveProfileEnvForRoot(this.repoRoot, catalog.runner)).profile.isDefault ||
+            !(await this.routingProviderAllowed(catalog.runner)))
+          return [];
+        return catalog.models.flatMap((option) => {
+          const facts = metadataForRunner(metadata, catalog.runner, option.metadataId ?? option.id)
+            ?? metadataForRunner(metadata, catalog.runner, option.id);
+          return facts ? [{ runner: catalog.runner, option, metadata: facts }] : [];
+        });
+      }))).flat();
+      // Only routed steps have an unambiguous persisted model. A small history
+      // is too noisy to rank; after five outcomes it nudges the quality floor.
+      const history = new Map<string, { success: number; total: number }>();
+      for (const prior of this.store.listRuns().slice(0, 200)) {
+        for (const priorStep of prior.steps) {
+          if (!priorStep.model || !priorStep.backend || !['done', 'failed'].includes(priorStep.status)) continue;
+          const key = `${priorStep.backend}/${priorStep.model}`;
+          const row = history.get(key) ?? { success: 0, total: 0 };
+          row.total += 1;
+          if (priorStep.status === 'done') row.success += 1;
+          history.set(key, row);
+        }
+      }
+      for (const candidate of candidates) {
+        const row = history.get(`${candidate.runner}/${candidate.option.id}`);
+        if (row && row.total >= 5) candidate.historicalSuccessRate = (row.success + 1) / (row.total + 2);
+      }
+      const choice = selectAdaptiveModel({
+        text: input.task,
+        preferredRunner: taskBackend,
+        ...(step.runner ? { allowedRunner: step.runner } : {}),
+        verificationFailures: shouldEscalateFromChecks(Boolean(checkFailure), this.store.getRun(runId)?.steps.find((entry) => entry.id === step.id)?.iterations ?? 0) ? 2 : 0,
+      }, candidates);
+      if (choice && (!input.reasoningEffort || runnerSupportsReasoningEffort(choice.runner))) {
+        step = { ...step, runner: choice.runner, model: choice.model,
+          reasoningEffort: input.reasoningEffort ?? choice.reasoningEffort };
+        this.store.updateStep(runId, step.id, { model: choice.model, adaptiveRouted: true });
+        emit({ type: 'note', stepId: step.id,
+          message: `adaptive model routing: ${choice.runner}/${choice.model}${step.reasoningEffort ? ` (${step.reasoningEffort})` : ''} — ${choice.reason}; selected from authenticated native discovery and Models.dev metadata` });
+      }
+    }
     let systemPrompt: string | undefined;
     // An attachment-only task (telemetry 18c930de) — the note stands in for the missing text, so a
     // step template (`Review: {{task}}`) still reads as a sentence.
@@ -7921,6 +8050,7 @@ export class RunManager {
     this.store.updateStep(runId, step.id, {
       sessionId,
       backend,
+      ...(graphHooks?.resumeSessionId && graphHooks.adaptiveRouted ? { adaptiveRouted: true } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
     });
 
@@ -8237,7 +8367,13 @@ export class RunManager {
         modelIdentity: normalized ? formatModelIdentity(normalized.identity) : undefined,
       });
       if (normalized) {
-        this.store.updateStep(runId, step.id, { modelIdentity: formatModelIdentity(normalized.identity) });
+        // A graph node that continues another node's session becomes an owner
+        // in turn. Persist its effective wire model so a further continuation
+        // or missing-session recovery cannot fall back to the provider default.
+        this.store.updateStep(runId, step.id, {
+          modelIdentity: formatModelIdentity(normalized.identity),
+          model: backendModel,
+        });
       }
     } catch (err) {
       if (err instanceof ModelIdentityError) return err.message;
@@ -8252,7 +8388,8 @@ export class RunManager {
     try {
       stepProfile = await this.agentEnvForStep(runId, stepBackend, {
         generateFollowups: followupsEnabled() && input.generateFollowups !== false,
-        ...(resumeStep ? { recordedProfileId: resumeStep.profileId ?? DEFAULT_AGENT_ACCOUNT_ID } : {}),
+        ...(resumeStep ? { recordedProfileId: resumeStep.profileId ?? DEFAULT_AGENT_ACCOUNT_ID }
+          : graphHooks?.recordedProfileId ? { recordedProfileId: graphHooks.recordedProfileId } : {}),
       });
     } catch (err) {
       if (err instanceof AgentTempDirError || err instanceof TrackerAgentBindingError) return err.message;
